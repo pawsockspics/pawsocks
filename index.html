@@ -8,6 +8,7 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
     width: 100%;
+    height: 100%;
     background: #0b0b0c;
     color: #eaeaea;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -26,24 +27,39 @@
     padding: 1.5rem;
   }
 
-  /* Gallery: flex row layout, images butted with zero gap, each row justified
-     to exactly fill the container width; row height adapts to viewport. */
+  /* Gallery: a justified mosaic. Rows are scaled to exactly fill the
+     container width; a partial last row is centered, never stretched. */
   #gallery {
-    display: flex;
-    flex-wrap: wrap;
     width: 100%;
     line-height: 0; /* kill inline-element whitespace gaps */
   }
 
-  #gallery img {
-    display: block;
-    object-fit: cover;
-    flex-shrink: 0;
+  #gallery .row {
+    display: flex;
+    width: 100%;
+    animation: galleryFade 0.5s ease both;
+  }
+
+  #gallery .row.last {
+    justify-content: center;
   }
 
   #gallery a {
     display: block;
     line-height: 0;
+    flex-shrink: 0;
+  }
+
+  #gallery img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  @keyframes galleryFade {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 </style>
 </head>
@@ -94,60 +110,89 @@
     });
   }
 
-  // Flickr-style "justified" layout: greedily group images into rows,
-  // then scale each row's height so the images' widths sum exactly to
-  // the container width. Gap between/around images is always 0.
+  // Flickr-style justified mosaic. Images are greedily packed into rows at
+  // a height found by binary search so the whole gallery fills the viewport
+  // edge to edge: every full row is scaled to exactly the container width,
+  // and the partial last row is centered instead of being stretched huge.
   function layoutGallery(items) {
     const gallery = document.getElementById("gallery");
     gallery.innerHTML = "";
 
     const containerWidth = gallery.clientWidth || window.innerWidth;
-    // Target row height scales with viewport so the grid always feels
-    // full, whether on a phone or an ultrawide monitor.
-    const targetRowHeight = Math.max(140, Math.min(340, containerWidth / 6));
+    const viewportHeight = window.innerHeight;
+    if (containerWidth <= 0 || items.length === 0) return;
 
-    let row = [];
-    let aspectSum = 0;
+    // Greedily pack items into rows at a given row height.
+    function pack(h) {
+      const rows = [];
+      let cur = [];
+      let sum = 0;
+      for (const item of items) {
+        cur.push(item);
+        sum += item.aspect;
+        if (sum * h >= containerWidth) {
+          rows.push(cur);
+          cur = [];
+          sum = 0;
+        }
+      }
+      if (cur.length) rows.push(cur);
+      return rows;
+    }
 
-    function flushRow(isLastRow) {
-      if (row.length === 0) return;
+    // Total height of the mosaic: full rows justified to the container
+    // width, the last row kept at the packing height.
+    function totalHeight(rows, h) {
+      return rows.reduce((total, row, i) => {
+        const rowAspect = row.reduce((s, it) => s + it.aspect, 0);
+        const rh = (i === rows.length - 1) ? h : containerWidth / rowAspect;
+        return total + rh;
+      }, 0);
+    }
 
-      // Justify every row (including the last) so the gallery always
-      // fills the full width edge to edge with no gaps.
-      const rowHeight = containerWidth / aspectSum;
+    // Binary search: pick the packing height so the mosaic fills the
+    // viewport height (it always fills the full width row by row).
+    let lo = 60;
+    let hi = 800;
+    for (let i = 0; i < 24; i++) {
+      const mid = (lo + hi) / 2;
+      if (totalHeight(pack(mid), mid) < viewportHeight) lo = mid;
+      else hi = mid;
+    }
+    const rows = pack(hi);
 
+    rows.forEach((row, i) => {
+      const isLast = i === rows.length - 1;
+      const rowAspect = row.reduce((s, it) => s + it.aspect, 0);
+      let rh = isLast ? hi : containerWidth / rowAspect;
+      if (isLast) {
+        // Never let the centered last row overflow the container.
+        const maxAspect = Math.max.apply(null, row.map(it => it.aspect));
+        rh = Math.min(rh, containerWidth / maxAspect);
+      }
+      rh = Math.max(24, rh);
+
+      const rowEl = document.createElement("div");
+      rowEl.className = isLast ? "row last" : "row";
       row.forEach(item => {
-        const width = item.aspect * rowHeight;
+        const width = item.aspect * rh;
         const link = document.createElement("a");
         link.href = item.src;
         link.target = "_blank";
         link.rel = "noopener";
         link.style.width = width + "px";
-        link.style.height = rowHeight + "px";
+        link.style.height = rh + "px";
 
         const imgEl = document.createElement("img");
         imgEl.src = item.src;
         imgEl.alt = "Pawsocks photo";
-        imgEl.style.width = width + "px";
-        imgEl.style.height = rowHeight + "px";
         imgEl.loading = "lazy";
 
         link.appendChild(imgEl);
-        gallery.appendChild(link);
+        rowEl.appendChild(link);
       });
-
-      row = [];
-      aspectSum = 0;
-    }
-
-    items.forEach(item => {
-      row.push(item);
-      aspectSum += item.aspect;
-      if (aspectSum * targetRowHeight >= containerWidth) {
-        flushRow(false);
-      }
+      gallery.appendChild(rowEl);
     });
-    flushRow(true);
   }
 
   async function init() {
@@ -169,9 +214,14 @@
     layoutGallery(items);
 
     let resizeTimer;
+    const relayout = () => layoutGallery(items);
     window.addEventListener("resize", () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => layoutGallery(items), 150);
+      resizeTimer = setTimeout(relayout, 100);
+    });
+    window.addEventListener("orientationchange", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(relayout, 250);
     });
   }
 
