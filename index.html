@@ -1,28 +1,182 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pawsocks</title>
-  <style>
-    html, body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      background: #000;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-    }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pawsocks</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    background: #0b0b0c;
+    color: #eaeaea;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
 
-    img {
-      width: 75%;
-      height: 75%;
-      object-fit: contain;
-    }
-  </style>
+  #status {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    letter-spacing: 0.02em;
+    color: #999;
+    text-align: center;
+    padding: 1.5rem;
+  }
+
+  /* Gallery: flex row layout, images butted with zero gap, each row justified
+     to exactly fill the container width; row height adapts to viewport. */
+  #gallery {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+    line-height: 0; /* kill inline-element whitespace gaps */
+  }
+
+  #gallery img {
+    display: block;
+    object-fit: cover;
+    flex-shrink: 0;
+  }
+
+  #gallery a {
+    display: block;
+    line-height: 0;
+  }
+</style>
 </head>
 <body>
-  <img src="https://i.imgur.com/Gyy6vsA.jpeg" alt="">
+<div id="status">Loading gallery…</div>
+<div id="gallery"></div>
+
+<script>
+(function () {
+  const OWNER = "pawsockspics";
+  const REPO = "pawsocks";
+  const BRANCH = "main";
+
+  // Known image files in the repo, used if the live GitHub API listing
+  // (rate-limited / CORS-sensitive) can't be reached.
+  const FALLBACK_FILES = [
+    "pawsocks (1).jpeg", "pawsocks (2).jpeg", "pawsocks (3).jpeg", "pawsocks (4).jpeg",
+    "pawsocks (5).jpeg", "pawsocks (6).jpeg", "pawsocks (7).jpeg", "pawsocks (8).jpeg",
+    "pawsocks (9).jpeg", "pawsocks (10).jpeg", "pawsocks (11).jpeg", "pawsocks (12).jpeg"
+  ];
+
+  function rawUrl(name) {
+    return `https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/${encodeURIComponent(name)}`;
+  }
+
+  async function getImageFileNames() {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/`);
+      if (!res.ok) throw new Error(`GitHub API responded ${res.status}`);
+      const data = await res.json();
+      const names = data
+        .filter(item => item.type === "file" && /\.(jpe?g|png)$/i.test(item.name))
+        .map(item => item.name);
+      if (names.length) return names;
+      throw new Error("No jpeg/png files found via API");
+    } catch (err) {
+      console.warn("Falling back to static file list:", err);
+      return FALLBACK_FILES;
+    }
+  }
+
+  function loadImage(src) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => resolve({ src, w: img.naturalWidth, h: img.naturalHeight });
+      img.onerror = () => resolve(null);
+      img.src = src;
+    });
+  }
+
+  // Flickr-style "justified" layout: greedily group images into rows,
+  // then scale each row's height so the images' widths sum exactly to
+  // the container width. Gap between/around images is always 0.
+  function layoutGallery(items) {
+    const gallery = document.getElementById("gallery");
+    gallery.innerHTML = "";
+
+    const containerWidth = gallery.clientWidth || window.innerWidth;
+    // Target row height scales with viewport so the grid always feels
+    // full, whether on a phone or an ultrawide monitor.
+    const targetRowHeight = Math.max(140, Math.min(340, containerWidth / 6));
+
+    let row = [];
+    let aspectSum = 0;
+
+    function flushRow(isLastRow) {
+      if (row.length === 0) return;
+
+      // Justify every row (including the last) so the gallery always
+      // fills the full width edge to edge with no gaps.
+      const rowHeight = containerWidth / aspectSum;
+
+      row.forEach(item => {
+        const width = item.aspect * rowHeight;
+        const link = document.createElement("a");
+        link.href = item.src;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.style.width = width + "px";
+        link.style.height = rowHeight + "px";
+
+        const imgEl = document.createElement("img");
+        imgEl.src = item.src;
+        imgEl.alt = "Pawsocks photo";
+        imgEl.style.width = width + "px";
+        imgEl.style.height = rowHeight + "px";
+        imgEl.loading = "lazy";
+
+        link.appendChild(imgEl);
+        gallery.appendChild(link);
+      });
+
+      row = [];
+      aspectSum = 0;
+    }
+
+    items.forEach(item => {
+      row.push(item);
+      aspectSum += item.aspect;
+      if (aspectSum * targetRowHeight >= containerWidth) {
+        flushRow(false);
+      }
+    });
+    flushRow(true);
+  }
+
+  async function init() {
+    const status = document.getElementById("status");
+    const fileNames = await getImageFileNames();
+    status.textContent = `Loading ${fileNames.length} images…`;
+
+    const results = await Promise.all(fileNames.map(name => loadImage(rawUrl(name))));
+    const loaded = results.filter(Boolean);
+
+    if (loaded.length === 0) {
+      status.textContent = "Couldn't load any images from the repository.";
+      return;
+    }
+
+    status.remove();
+
+    const items = loaded.map(item => ({ src: item.src, aspect: item.w / item.h }));
+    layoutGallery(items);
+
+    let resizeTimer;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => layoutGallery(items), 150);
+    });
+  }
+
+  init();
+})();
+</script>
 </body>
 </html>
