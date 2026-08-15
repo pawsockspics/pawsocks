@@ -8,11 +8,13 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
     width: 100%;
-    height: 100%;
+    min-height: 100%;
     background: #0b0b0c;
     color: #eaeaea;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   }
+
+  body { zoom: 1.25; }
 
   #status {
     position: fixed;
@@ -25,29 +27,31 @@
     color: #999;
     text-align: center;
     padding: 1.5rem;
+    z-index: 10;
+    background: #0b0b0c;
   }
 
-  /* Gallery: a justified mosaic. Rows are scaled to exactly fill the
-     container width; a partial last row is centered, never stretched. */
   #gallery {
     width: 100%;
-    line-height: 0; /* kill inline-element whitespace gaps */
+    line-height: 0;
+    padding-bottom: 80px;
   }
 
   #gallery .row {
     display: flex;
     width: 100%;
-    animation: galleryFade 0.5s ease both;
+    overflow: hidden;
   }
 
-  #gallery .row.last {
-    justify-content: center;
+  #gallery .row.new {
+    animation: galleryFade 0.35s ease both;
   }
 
   #gallery a {
     display: block;
     line-height: 0;
     flex-shrink: 0;
+    overflow: hidden;
   }
 
   #gallery img {
@@ -57,171 +61,260 @@
     object-fit: cover;
   }
 
+  #loader {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.78rem;
+    color: #666;
+    letter-spacing: 0.03em;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+    z-index: 5;
+  }
+  #loader.visible { opacity: 1; }
+
   @keyframes galleryFade {
-    from { opacity: 0; transform: translateY(6px); }
+    from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
   }
 </style>
 </head>
 <body>
-<div id="status">Loading gallery…</div>
+<div id="status">loading</div>
 <div id="gallery"></div>
+<div id="loader">loading more…</div>
 
 <script>
 (function () {
-  const OWNER = "pawsockspics";
-  const REPO = "pawsocks";
-  const BRANCH = "main";
-
-  // Known image files in the repo, used if the live GitHub API listing
-  // (rate-limited / CORS-sensitive) can't be reached.
-  const FALLBACK_FILES = [
-    "pawsocks (1).jpeg", "pawsocks (2).jpeg", "pawsocks (3).jpeg", "pawsocks (4).jpeg",
-    "pawsocks (5).jpeg", "pawsocks (6).jpeg", "pawsocks (7).jpeg", "pawsocks (8).jpeg",
-    "pawsocks (9).jpeg", "pawsocks (10).jpeg", "pawsocks (11).jpeg", "pawsocks (12).jpeg"
+  const QUERIES = [
+    "egirl female in pawsocks (cat socks)",
+    "egirl female pawsocks cat socks",
+    "female egirl pawsocks",
+    "egirl in cat paw socks",
+    "egirl cat socks female",
+    "female cat paw socks egirl",
+    "egirl pawsocks",
+    "cat socks egirl female",
+    "paw socks egirl girl",
+    "egirl thigh high cat socks",
+    "female in paw socks",
+    "egirl cat paw socks"
   ];
 
-  function rawUrl(name) {
-    return `https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/${encodeURIComponent(name)}`;
+  // Exact URL blacklist
+  const BLACKLIST = new Set([
+    "https://i.pinimg.com/originals/26/73/7b/26737b0531866e79e1a48fab0f5e6c73.jpg"
+  ]);
+
+  const BATCH_SIZE = 10;
+  const FETCH_INTERVAL = 500;
+
+  const TARGET_ROW_H = () => Math.max(160, Math.min(260, Math.round(window.innerHeight * 0.26)));
+
+  let pool = [];
+  let rendered = 0;
+  let queryIndex = 0;
+  let seen = new Set();
+  let loading = false;
+  let rowH = TARGET_ROW_H();
+
+  const statusEl = document.getElementById("status");
+  const galleryEl = document.getElementById("gallery");
+  const loaderEl = document.getElementById("loader");
+
+  function pinId(url) {
+    try {
+      const m = url.match(/\/([0-9a-f]{16,})\./i) ||
+                url.match(/\/([0-9a-f]{8}\/[0-9a-f]{8}\/[0-9a-f]{8}\/[0-9a-f]{8,})/i);
+      if (m) return m[1].replace(/\//g, "");
+      const parts = url.split("/");
+      return parts[parts.length - 1].split("?")[0].split(".")[0];
+    } catch {
+      return url;
+    }
   }
 
-  async function getImageFileNames() {
-    try {
-      const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/`);
-      if (!res.ok) throw new Error(`GitHub API responded ${res.status}`);
-      const data = await res.json();
-      const names = data
-        .filter(item => item.type === "file" && /\.(jpe?g|png)$/i.test(item.name))
-        .map(item => item.name);
-      if (names.length) return names;
-      throw new Error("No jpeg/png files found via API");
-    } catch (err) {
-      console.warn("Falling back to static file list:", err);
-      return FALLBACK_FILES;
-    }
+  // Also blacklist by id so size variants are caught
+  BLACKLIST.forEach(u => seen.add(pinId(u)));
+
+  async function searchPinterest(query) {
+    const url = `https://prexzyapis.com/search/pinterest?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.status || !Array.isArray(json.data)) return [];
+    return json.data.filter(u => typeof u === "string" && /i\.pinimg\.com/i.test(u));
   }
 
   function loadImage(src) {
     return new Promise(resolve => {
       const img = new Image();
-      img.onload = () => resolve({ src, w: img.naturalWidth, h: img.naturalHeight });
+      img.onload = () => {
+        if (img.naturalWidth < 80 || img.naturalHeight < 80) {
+          resolve(null);
+          return;
+        }
+        resolve({ src, w: img.naturalWidth, h: img.naturalHeight });
+      };
       img.onerror = () => resolve(null);
       img.src = src;
     });
   }
 
-  // Flickr-style justified mosaic. Images are greedily packed into rows at
-  // a height found by binary search so the whole gallery fills the viewport
-  // edge to edge: every full row is scaled to exactly the container width,
-  // and the partial last row is centered instead of being stretched huge.
-  function layoutGallery(items) {
-    const gallery = document.getElementById("gallery");
-    gallery.innerHTML = "";
-
-    const containerWidth = gallery.clientWidth || window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    if (containerWidth <= 0 || items.length === 0) return;
-
-    // Greedily pack items into rows at a given row height.
-    function pack(h) {
-      const rows = [];
-      let cur = [];
-      let sum = 0;
-      for (const item of items) {
-        cur.push(item);
-        sum += item.aspect;
-        if (sum * h >= containerWidth) {
-          rows.push(cur);
-          cur = [];
-          sum = 0;
+  async function fetchBatch() {
+    const fresh = [];
+    const tries = Math.min(6, QUERIES.length);
+    for (let i = 0; i < tries && fresh.length < BATCH_SIZE; i++) {
+      const q = QUERIES[queryIndex % QUERIES.length];
+      queryIndex++;
+      try {
+        const urls = await searchPinterest(q);
+        for (const u of urls) {
+          if (BLACKLIST.has(u)) continue;
+          const id = pinId(u);
+          if (seen.has(id)) continue;
+          seen.add(id);
+          fresh.push(u);
+          if (fresh.length >= BATCH_SIZE) break;
         }
+      } catch (e) {
+        console.warn("query failed", q, e);
       }
-      if (cur.length) rows.push(cur);
-      return rows;
     }
+    return fresh;
+  }
 
-    // Total height of the mosaic: full rows justified to the container
-    // width, the last row kept at the packing height.
-    function totalHeight(rows, h) {
-      return rows.reduce((total, row, i) => {
-        const rowAspect = row.reduce((s, it) => s + it.aspect, 0);
-        const rh = (i === rows.length - 1) ? h : containerWidth / rowAspect;
-        return total + rh;
-      }, 0);
+  async function loadAndAdd(urls) {
+    if (!urls.length) return 0;
+    const results = await Promise.all(urls.map(loadImage));
+    let added = 0;
+    for (const r of results) {
+      if (!r) continue;
+      if (BLACKLIST.has(r.src)) continue;
+      const id = pinId(r.src);
+      if (pool.some(p => p.id === id)) continue;
+      pool.push({ src: r.src, aspect: r.w / r.h, id });
+      added++;
     }
+    return added;
+  }
 
-    // Binary search: pick the packing height so the mosaic fills the
-    // viewport height (it always fills the full width row by row).
-    let lo = 60;
-    let hi = 800;
-    for (let i = 0; i < 24; i++) {
-      const mid = (lo + hi) / 2;
-      if (totalHeight(pack(mid), mid) < viewportHeight) lo = mid;
-      else hi = mid;
-    }
-    const rows = pack(hi);
+  function appendRows(fromIndex, maxImages) {
+    const available = pool.slice(fromIndex, fromIndex + maxImages);
+    if (!available.length) return 0;
 
-    rows.forEach((row, i) => {
-      const isLast = i === rows.length - 1;
-      const rowAspect = row.reduce((s, it) => s + it.aspect, 0);
-      let rh = isLast ? hi : containerWidth / rowAspect;
-      if (isLast) {
-        // Never let the centered last row overflow the container.
-        const maxAspect = Math.max.apply(null, row.map(it => it.aspect));
-        rh = Math.min(rh, containerWidth / maxAspect);
+    const containerWidth = galleryEl.clientWidth || window.innerWidth;
+    if (containerWidth <= 0) return 0;
+
+    const rows = [];
+    let cur = [];
+    let sumAspect = 0;
+    let used = 0;
+
+    for (const item of available) {
+      cur.push(item);
+      sumAspect += item.aspect;
+      used++;
+      if (sumAspect * rowH >= containerWidth * 0.98) {
+        rows.push({ items: cur, aspectSum: sumAspect });
+        cur = [];
+        sumAspect = 0;
       }
-      rh = Math.max(24, rh);
+    }
 
+    rows.forEach(row => {
+      const rh = containerWidth / row.aspectSum;
       const rowEl = document.createElement("div");
-      rowEl.className = isLast ? "row last" : "row";
-      row.forEach(item => {
-        const width = item.aspect * rh;
+      rowEl.className = "row new";
+
+      row.items.forEach(item => {
+        const w = item.aspect * rh;
         const link = document.createElement("a");
         link.href = item.src;
         link.target = "_blank";
         link.rel = "noopener";
-        link.style.width = width + "px";
-        link.style.height = rh + "px";
+        link.style.width = Math.floor(w) + "px";
+        link.style.height = Math.floor(rh) + "px";
 
-        const imgEl = document.createElement("img");
-        imgEl.src = item.src;
-        imgEl.alt = "Pawsocks photo";
-        imgEl.loading = "lazy";
+        const img = document.createElement("img");
+        img.src = item.src;
+        img.alt = "egirl female in pawsocks";
+        img.loading = "lazy";
+        img.decoding = "async";
 
-        link.appendChild(imgEl);
+        link.appendChild(img);
         rowEl.appendChild(link);
       });
-      gallery.appendChild(rowEl);
+
+      const links = rowEl.querySelectorAll("a");
+      if (links.length) {
+        let total = 0;
+        links.forEach(a => total += parseInt(a.style.width, 10));
+        const diff = containerWidth - total;
+        if (diff !== 0) {
+          const last = links[links.length - 1];
+          last.style.width = (parseInt(last.style.width, 10) + diff) + "px";
+        }
+      }
+
+      galleryEl.appendChild(rowEl);
     });
+
+    return used - cur.length;
+  }
+
+  function revealAvailable() {
+    if (rendered >= pool.length) return 0;
+    const added = appendRows(rendered, pool.length - rendered);
+    rendered += added;
+    return added;
+  }
+
+  async function cycle() {
+    if (loading) return;
+    loading = true;
+    loaderEl.classList.add("visible");
+    try {
+      const urls = await fetchBatch();
+      if (urls.length) {
+        await loadAndAdd(urls);
+        revealAvailable();
+      }
+    } finally {
+      loading = false;
+      loaderEl.classList.remove("visible");
+    }
+  }
+
+  function fullRelayout() {
+    rowH = TARGET_ROW_H();
+    galleryEl.innerHTML = "";
+    const prev = rendered;
+    rendered = 0;
+    while (rendered < prev) {
+      const n = appendRows(rendered, 30);
+      if (!n) break;
+      rendered += n;
+    }
   }
 
   async function init() {
-    const status = document.getElementById("status");
-    const fileNames = await getImageFileNames();
-    status.textContent = `Loading ${fileNames.length} images…`;
+    statusEl.textContent = "loading";
+    rowH = TARGET_ROW_H();
 
-    const results = await Promise.all(fileNames.map(name => loadImage(rawUrl(name))));
-    const loaded = results.filter(Boolean);
-
-    if (loaded.length === 0) {
-      status.textContent = "Couldn't load any images from the repository.";
-      return;
+    for (let i = 0; i < 3; i++) {
+      await cycle();
     }
+    statusEl.remove();
 
-    status.remove();
+    setInterval(cycle, FETCH_INTERVAL);
 
-    const items = loaded.map(item => ({ src: item.src, aspect: item.w / item.h }));
-    layoutGallery(items);
-
-    let resizeTimer;
-    const relayout = () => layoutGallery(items);
     window.addEventListener("resize", () => {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(relayout, 100);
-    });
-    window.addEventListener("orientationchange", () => {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(relayout, 250);
+      clearTimeout(window.__rt);
+      window.__rt = setTimeout(fullRelayout, 120);
     });
   }
 
