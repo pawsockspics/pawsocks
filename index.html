@@ -24,7 +24,6 @@
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Desktop: 125% feel without breaking mobile scroll */
   @media (min-width: 768px) {
     body { zoom: 1.25; }
   }
@@ -54,6 +53,7 @@
     display: flex;
     width: 100%;
     overflow: hidden;
+    /* explicit height set in JS so row never reflows when images load */
   }
 
   #gallery .row.new {
@@ -73,7 +73,7 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
-    pointer-events: none; /* prevents image drag interfering with scroll */
+    pointer-events: none;
   }
 
   #loader {
@@ -125,7 +125,6 @@
 
   const TARGET_ROW_H = () => {
     const h = window.innerHeight;
-    // slightly smaller rows on mobile so more fit
     if (window.innerWidth < 768) return Math.max(120, Math.min(200, Math.round(h * 0.22)));
     return Math.max(160, Math.min(260, Math.round(h * 0.26)));
   };
@@ -136,6 +135,7 @@
   let seen = new Set();
   let loading = false;
   let rowH = TARGET_ROW_H();
+  let lastWidth = window.innerWidth;
 
   const statusEl = document.getElementById("status");
   const galleryEl = document.getElementById("gallery");
@@ -244,6 +244,8 @@
       const rh = containerWidth / row.aspectSum;
       const rowEl = document.createElement("div");
       rowEl.className = "row new";
+      // lock row height so images loading later cannot shift layout
+      rowEl.style.height = Math.floor(rh) + "px";
 
       row.items.forEach(item => {
         const w = item.aspect * rh;
@@ -305,6 +307,11 @@
   }
 
   function fullRelayout() {
+    // preserve visual scroll position across rebuild
+    const scrollRatio = document.documentElement.scrollHeight > 0
+      ? window.pageYOffset / document.documentElement.scrollHeight
+      : 0;
+
     rowH = TARGET_ROW_H();
     galleryEl.innerHTML = "";
     const prev = rendered;
@@ -314,9 +321,27 @@
       if (!n) break;
       rendered += n;
     }
+
+    // restore relative scroll position
+    requestAnimationFrame(() => {
+      window.scrollTo(0, scrollRatio * document.documentElement.scrollHeight);
+    });
   }
 
-  // Smooth mobile scroll + load more near bottom
+  // only react to width changes (ignore mobile address-bar height jitter)
+  window.addEventListener("resize", () => {
+    if (window.innerWidth === lastWidth) return;
+    lastWidth = window.innerWidth;
+    clearTimeout(window.__rt);
+    window.__rt = setTimeout(fullRelayout, 150);
+  });
+
+  window.addEventListener("orientationchange", () => {
+    lastWidth = window.innerWidth;
+    clearTimeout(window.__rt);
+    window.__rt = setTimeout(fullRelayout, 250);
+  });
+
   let scrollLocked = false;
   function onScroll() {
     if (scrollLocked) return;
@@ -334,6 +359,7 @@
   async function init() {
     statusEl.textContent = "loading";
     rowH = TARGET_ROW_H();
+    lastWidth = window.innerWidth;
 
     for (let i = 0; i < 3; i++) {
       await cycle();
@@ -343,16 +369,6 @@
     setInterval(cycle, FETCH_INTERVAL);
 
     window.addEventListener("scroll", onScroll, { passive: true });
-    window.addEventListener("touchmove", onScroll, { passive: true });
-
-    window.addEventListener("resize", () => {
-      clearTimeout(window.__rt);
-      window.__rt = setTimeout(fullRelayout, 150);
-    });
-    window.addEventListener("orientationchange", () => {
-      clearTimeout(window.__rt);
-      window.__rt = setTimeout(fullRelayout, 250);
-    });
   }
 
   init();
