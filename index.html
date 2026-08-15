@@ -91,10 +91,16 @@
 (function () {
   const QUERIES = [
     "egirl cat paws socks",
-    "egirl female pawsocks cat socks"
+    "egirl female in pawsocks (cat socks)",
+    "female cute paw socks",
+    "neko socks",
+    "egirl catgirl paw socks",
+    "pawsocks discord @",
+    "paws egirl",
+    "stockings with cat paws",
+    "white paw socks"
   ];
 
-  // Exact URL blacklist
   const BLACKLIST = new Set([
     "https://i.pinimg.com/originals/26/73/7b/26737b0531866e79e1a48fab0f5e6c73.jpg"
   ]);
@@ -127,7 +133,6 @@
     }
   }
 
-  // Also blacklist by id so size variants are caught
   BLACKLIST.forEach(u => seen.add(pinId(u)));
 
   async function searchPinterest(query) {
@@ -156,7 +161,7 @@
 
   async function fetchBatch() {
     const fresh = [];
-    const tries = Math.min(6, QUERIES.length);
+    const tries = Math.min(QUERIES.length, 6);
     for (let i = 0; i < tries && fresh.length < BATCH_SIZE; i++) {
       const q = QUERIES[queryIndex % QUERIES.length];
       queryIndex++;
@@ -231,7 +236,7 @@
 
         const img = document.createElement("img");
         img.src = item.src;
-        img.alt = "egirl female in pawsocks";
+        img.alt = "pawsocks";
         img.loading = "lazy";
         img.decoding = "async";
 
