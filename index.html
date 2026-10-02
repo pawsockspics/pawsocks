@@ -29,9 +29,10 @@
   #loader {
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
     font-size: 0.78rem; color: #666; letter-spacing: 0.03em; pointer-events: none;
-    opacity: 0; transition: opacity 0.2s; z-index: 5;
+    opacity: 0; transition: opacity 0.2s; z-index: 5; white-space: nowrap;
   }
   #loader.visible { opacity: 1; }
+  #loader.action { pointer-events: auto; cursor: pointer; color: #aaa; }
   @keyframes galleryFade {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -45,38 +46,12 @@
 
 <script>
 (function () {
-  const QUERIES = [
-    "egirl cat paws socks",
-    "egirl female in pawsocks (cat socks)",
-    "female cute paw socks",
-    "egirl neko catsocks pawsocks",
-    "egirl catgirl paw socks",
-    "pawsocks discord @",
-    "paws egirl",
-    "egirl stockings with pawsocks",
-    "egirl white pawsocks"
-  ];
+  const API        = "https://api.pawsocks.pics/v1/images";
+  const PAGE_LIMIT = 30;            // images per request (max 50). Rate limit is 300 images/min per IP.
+  const PREFETCH   = 900;           // px from bottom before the next page is requested
 
-  const BLACKLIST = new Set([
-    "https://i.pinimg.com/originals/26/73/7b/26737b0531866e79e1a48fab0f5e6c73.jpg"
-  ]);
-
-  const BATCH_SIZE    = 10;
-  const FETCH_INTERVAL = 1500;
-  const FETCH_TIMEOUT  = 8000;
-  const MAX_ATTEMPTS_PER_QUERY = 4;  // how many combos to try per query per batch call
-
-  // Modifier suffixes appended to base queries to force Pinterest to return a
-  // DIFFERENT result set. This matters because the prexzyapis wrapper appears to
-  // be a thin passthrough over Pinterest's basic keyword search with no real
-  // pagination cursor — requesting the same query string twice (even with a
-  // page param) just returns the same fixed set. Changing the query text is
-  // what actually changes what comes back.
-  const MODIFIERS = [
-    "", "aesthetic", "cute style", "soft grunge", "kawaii",
-    "trend 2025", "outfit inspo", "core aesthetic", "cozy fit",
-    "y2k", "pastel", "photo dump", "collage", "vibe"
-  ];
+  // Image ids to never show
+  const BLACKLIST = new Set(["26737b0531866e79e1a48fab0f5e6c73"]);
 
   const TARGET_ROW_H = () => {
     const h = window.innerHeight;
@@ -84,149 +59,80 @@
     return Math.max(160, Math.min(260, Math.round(h * 0.26)));
   };
 
-  let pool     = [];
+  const pool = [];
+  const seen = new Set(BLACKLIST);
   let rendered = 0;
-  let seen     = new Set();
-  let loading  = false;
-  let rowH     = TARGET_ROW_H();
+  let rowH = TARGET_ROW_H();
   let lastWidth = window.innerWidth;
-  let emptyStreak = 0;
 
-  // ── Query rotation state ──────────────────────────────────────────────────────
-  // Each base query gets its own combo cursor. A "combo" = (modifier, page).
-  // We build a fixed list of combos per query (modifiers × a few pages) and walk
-  // through it. This gives ~14 modifiers × 3 pages = 42 distinct query variants
-  // PER base query (378 total) before anything has to repeat — by which point
-  // Pinterest's own trending results have likely shifted anyway.
-  const PAGES_PER_MODIFIER = 3;
-  const combos = [];
-  for (const mod of MODIFIERS) {
-    for (let p = 1; p <= PAGES_PER_MODIFIER; p++) combos.push({ mod, page: p });
-  }
-
-  const qstate = QUERIES.map(() => ({ comboIndex: 0 }));
-  let qCursor = 0;  // round-robin pointer across base queries
-  let fullCycles = 0; // how many times we've wrapped every query through all combos
+  // Pagination state: one random shuffle, kept stable with seed + snapshot
+  let page = 1, seed = null, snapshot = null;
+  let finished = false;             // has_more was false: everything has been seen
+  let loading = false;
+  let blockedUntil = 0;             // ms timestamp; don't call the API before this
 
   const statusEl  = document.getElementById("status");
   const galleryEl = document.getElementById("gallery");
   const loaderEl  = document.getElementById("loader");
 
-  function pinId(url) {
-    try {
-      const m = url.match(/\/([0-9a-f]{16,})\./i) ||
-                url.match(/\/([0-9a-f]{8}\/[0-9a-f]{8}\/[0-9a-f]{8}\/[0-9a-f]{8,})/i);
-      if (m) return m[1].replace(/\//g, "");
-      const parts = url.split("/");
-      return parts[parts.length - 1].split("?")[0].split(".")[0];
-    } catch { return url; }
-  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  BLACKLIST.forEach(u => seen.add(pinId(u)));
+  // ── API ──────────────────────────────────────────────────────────────────────
+  async function fetchPage() {
+    const q = new URLSearchParams({ sort: "random", limit: PAGE_LIMIT, page });
+    if (seed !== null)     q.set("seed", seed);
+    if (snapshot !== null) q.set("snapshot", snapshot);
 
-  // ── API call with AbortController timeout ────────────────────────────────────
-  // `page` is still sent in case the API does honor it for some queries — it's
-  // free to include and costs nothing if ignored. The `_` cache-buster prevents
-  // any CDN/browser caching from serving a stale identical response.
-  async function searchPinterest(query, page) {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-    try {
-      const url = `https://prexzyapis.com/search/pinterest?q=${encodeURIComponent(query)}&page=${page}&_=${Date.now()}`;
-      const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      if (!json.status || !Array.isArray(json.data)) return [];
-      return json.data.filter(u => typeof u === "string" && /i\.pinimg\.com/i.test(u));
-    } finally {
-      clearTimeout(tid);
+    const res = await fetch(`${API}?${q}`);
+
+    // Rate limited: wait for Retry-After, then let the caller try again
+    if (res.status === 429) {
+      const wait = Number(res.headers.get("Retry-After") || 5);
+      blockedUntil = Date.now() + wait * 1000;
+      throw Object.assign(new Error("rate limited"), { rateLimited: true, wait });
     }
-  }
+    if (!res.ok) throw new Error("HTTP " + res.status);
 
-  // ── Smart per-query fetch ────────────────────────────────────────────────────
-  // Walks this query's combo list (modifier + page). Each combo is a genuinely
-  // different search string sent to Pinterest, so results differ even though
-  // the underlying API likely ignores `page` on its own. Tries up to
-  // MAX_ATTEMPTS_PER_QUERY combos in a row if earlier ones come back all-duplicate,
-  // instead of silently giving up and waiting for the next interval tick.
-  async function fetchFromQuery(qi, needed) {
-    const base = QUERIES[qi];
-    const st   = qstate[qi];
-    const fresh = [];
-
-    for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_QUERY && fresh.length < needed; attempt++) {
-      const combo = combos[st.comboIndex % combos.length];
-      const q = combo.mod ? `${base} ${combo.mod}` : base;
-
-      // Advance cursor now so a failed/duplicate attempt doesn't loop forever
-      st.comboIndex++;
-      if (st.comboIndex % combos.length === 0) fullCycles++;
-
-      try {
-        const urls = await searchPinterest(q, combo.page);
-        let addedThisAttempt = 0;
-        for (const u of urls) {
-          if (BLACKLIST.has(u)) continue;
-          const id = pinId(u);
-          if (seen.has(id)) continue;
-          seen.add(id);
-          fresh.push(u);
-          addedThisAttempt++;
-          if (fresh.length >= needed) break;
-        }
-        if (addedThisAttempt > 0) {
-          // Got something new — good combo, no need to keep burning attempts
-          break;
-        }
-        // else: fully duplicate result, loop continues to next combo automatically
-      } catch (e) {
-        console.warn("query failed", q, "p" + combo.page, e.name === "AbortError" ? "(timeout)" : e);
-      }
+    // Not enough budget left for another full page? Pause until the counter resets.
+    const remaining = Number(res.headers.get("X-RateLimit-Remaining"));
+    const reset     = Number(res.headers.get("X-RateLimit-Reset"));
+    if (Number.isFinite(remaining) && remaining < PAGE_LIMIT && reset) {
+      blockedUntil = reset * 1000;
     }
 
-    return fresh;
+    const json = await res.json();
+    const p = json.pagination;
+    seed = p.seed;
+    snapshot = p.snapshot;
+    if (p.has_more) page = p.next_page; else finished = true;
+    return json.data || [];
   }
 
-  // ── Batch fetcher: round-robin across base queries ───────────────────────────
-  async function fetchBatch() {
-    const fresh = [];
-    for (let i = 0; i < QUERIES.length && fresh.length < BATCH_SIZE; i++) {
-      const qi  = (qCursor + i) % QUERIES.length;
-      const got = await fetchFromQuery(qi, BATCH_SIZE - fresh.length);
-      fresh.push(...got);
-    }
-    qCursor = (qCursor + 1) % QUERIES.length;
-    return fresh;
-  }
+  // HEIC doesn't display in most browsers, so skip those images entirely
+  const isHeic = u => /\.heic?(\?|#|$)/i.test(u || "");
 
-  function loadImage(src) {
-    return new Promise(resolve => {
-      const img = new Image();
-      img.onload = () => {
-        if (img.naturalWidth < 80 || img.naturalHeight < 80) { resolve(null); return; }
-        resolve({ src, w: img.naturalWidth, h: img.naturalHeight });
-      };
-      img.onerror = () => resolve(null);
-      img.src = src;
-    });
-  }
-
-  async function loadAndAdd(urls) {
-    if (!urls.length) return 0;
-    const results = await Promise.all(urls.map(loadImage));
+  function addToPool(items) {
     let added = 0;
-    for (const r of results) {
-      if (!r) continue;
-      if (BLACKLIST.has(r.src)) continue;
-      const id = pinId(r.src);
-      if (pool.some(p => p.id === id)) continue;
-      pool.push({ src: r.src, aspect: r.w / r.h, id });
+    for (const it of items) {
+      if (!it || seen.has(it.id)) continue;
+      if (isHeic(it.url) || isHeic(it.thumbnail)) { seen.add(it.id); continue; }
+      seen.add(it.id);
+      pool.push({
+        id: it.id,
+        thumb: it.thumbnail || it.url,
+        url: it.url,
+        aspect: it.aspect || (it.width / it.height) || 1
+      });
       added++;
     }
     return added;
   }
 
-  function appendRows(fromIndex, maxImages) {
+  // ── Layout ───────────────────────────────────────────────────────────────────
+  // Justified rows built from the aspect ratios the API gives us, so no image
+  // has to be preloaded to measure it. A trailing partial row waits for more
+  // images, unless `flush` is set (nothing more is coming).
+  function appendRows(fromIndex, maxImages, flush) {
     const available = pool.slice(fromIndex, fromIndex + maxImages);
     if (!available.length) return 0;
     const containerWidth = galleryEl.clientWidth || window.innerWidth;
@@ -241,32 +147,37 @@
         cur = []; sumAspect = 0;
       }
     }
+    if (flush && cur.length) {
+      rows.push({ items: cur, aspectSum: Math.max(sumAspect, containerWidth / rowH) });
+      cur = [];
+    }
 
     rows.forEach(row => {
       const rh    = containerWidth / row.aspectSum;
       const rowEl = document.createElement("div");
-      rowEl.className   = "row new";
+      rowEl.className    = "row new";
       rowEl.style.height = Math.floor(rh) + "px";
 
       row.items.forEach(item => {
-        const link       = document.createElement("a");
-        link.href        = item.src;
-        link.target      = "_blank";
-        link.rel         = "noopener";
+        const link = document.createElement("a");
+        link.href   = item.url;
+        link.target = "_blank";
+        link.rel    = "noopener";
         link.style.width  = Math.floor(item.aspect * rh) + "px";
         link.style.height = Math.floor(rh) + "px";
-        const img        = document.createElement("img");
-        img.src          = item.src;
-        img.alt          = "pawsocks";
-        img.loading      = "lazy";
-        img.decoding     = "async";
+        const img = document.createElement("img");
+        img.src      = item.thumb;
+        img.alt      = "pawsocks";
+        img.loading  = "lazy";
+        img.decoding = "async";
+        img.onerror  = () => { if (img.src !== item.url) img.src = item.url; };
         link.appendChild(img);
         rowEl.appendChild(link);
       });
 
-      // Pixel-perfect fill: absorb rounding error into the last cell
+      // Pixel-perfect fill: absorb rounding error into the last cell (full rows only)
       const links = rowEl.querySelectorAll("a");
-      if (links.length) {
+      if (links.length && Math.abs(row.aspectSum * rh - containerWidth) < 1) {
         let total = 0;
         links.forEach(a => total += parseInt(a.style.width, 10));
         const diff = containerWidth - total;
@@ -283,43 +194,68 @@
 
   function revealAvailable() {
     if (rendered >= pool.length) return 0;
-    const added = appendRows(rendered, pool.length - rendered);
-    rendered += added;
-    return added;
+    const n = appendRows(rendered, pool.length - rendered, finished);
+    rendered += n;
+    return n;
   }
 
-  // ── Main cycle ───────────────────────────────────────────────────────────────
-  // Returns true if at least one new image was added, false otherwise. The
-  // caller uses this to decide how long to wait before trying again.
-  async function cycle() {
-    if (loading) return false;
-    loading = true;
+  // ── Loading cycle ────────────────────────────────────────────────────────────
+  function showLoader(text, action) {
+    loaderEl.textContent = text;
     loaderEl.classList.add("visible");
-    loaderEl.textContent = "loading more…";
-    let gotNew = false;
+    loaderEl.classList.toggle("action", !!action);
+  }
+  function hideLoader() { loaderEl.classList.remove("visible", "action"); }
+
+  async function cycle() {
+    if (loading || finished) return false;
+    const wait = blockedUntil - Date.now();
+    if (wait > 0) {
+      showLoader("cooling down for a moment…");
+      await sleep(wait + 200);
+    }
+    loading = true;
+    showLoader("loading more…");
+    let ok = false;
     try {
-      const urls = await fetchBatch();
-      if (urls.length) {
-        await loadAndAdd(urls);
-        revealAvailable();
-        emptyStreak = 0;
-        gotNew = true;
-      } else {
-        emptyStreak++;
-        if (emptyStreak === 3) {
-          // `seen` is NEVER cleared — that would re-show images already scrolled
-          // past, which is exactly what was asked not to happen. comboIndex just
-          // keeps incrementing and wraps via modulo on its own; this is purely
-          // a diagnostic log so it's visible in devtools that we've covered
-          // every query/modifier/page combination currently available.
-          console.info(`No new images across all ${combos.length * QUERIES.length} query combos (wrap #${fullCycles}). Backing off — will keep retrying as new pins get indexed.`);
-        }
-      }
+      addToPool(await fetchPage());
+      revealAvailable();
+      ok = true;
+    } catch (e) {
+      console.warn("fetch failed", e);
+      if (e.rateLimited) showLoader("slow down a little — retrying…");
     } finally {
       loading = false;
-      loaderEl.classList.remove("visible");
+      if (finished) showEnd(); else if (ok) hideLoader();
     }
-    return gotNew;
+    return ok;
+  }
+
+  function showEnd() {
+    showLoader("that's all of them · tap to shuffle again", true);
+  }
+
+  function reshuffle() {
+    if (!finished) return;
+    page = 1; seed = null; snapshot = null; finished = false;
+    BLACKLIST.forEach(id => seen.add(id));
+    pool.length = 0; seen.clear(); BLACKLIST.forEach(id => seen.add(id));
+    rendered = 0;
+    galleryEl.innerHTML = "";
+    window.scrollTo(0, 0);
+    hideLoader();
+    fillScreen();
+  }
+  loaderEl.addEventListener("click", reshuffle);
+
+  // Keep requesting until the page is comfortably taller than the screen
+  async function fillScreen() {
+    let guard = 0;
+    while (!finished && guard++ < 6 &&
+           document.documentElement.scrollHeight < window.innerHeight * 2.5) {
+      const ok = await cycle();
+      if (!ok) await sleep(1500);
+    }
   }
 
   function fullRelayout() {
@@ -328,7 +264,11 @@
     rowH = TARGET_ROW_H();
     galleryEl.innerHTML = "";
     const prev = rendered; rendered = 0;
-    while (rendered < prev) { const n = appendRows(rendered, 30); if (!n) break; rendered += n; }
+    while (rendered < prev) {
+      const n = appendRows(rendered, 30, finished && rendered + 30 >= pool.length);
+      if (!n) break;
+      rendered += n;
+    }
     requestAnimationFrame(() => window.scrollTo(0, scrollRatio * document.documentElement.scrollHeight));
   }
 
@@ -344,46 +284,26 @@
     window.__rt = setTimeout(fullRelayout, 250);
   });
 
-  let scrollLocked = false;
   function onScroll() {
-    if (scrollLocked) return;
+    if (loading || finished) return;
     const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
     const docH      = document.documentElement.scrollHeight;
-    if (docH - scrollTop - window.innerHeight < 900) {
-      scrollLocked = true;
-      // Scroll-triggered fetch also benefits from a faster retry — reset backoff
-      // so the user isn't stuck waiting on a long backoff delay just because
-      // they scrolled during a dry spell.
-      currentDelay = FETCH_INTERVAL;
-      cycle().finally(() => setTimeout(() => { scrollLocked = false; }, 400));
-    }
-  }
-
-  // ── Adaptive polling ─────────────────────────────────────────────────────────
-  // Fast (FETCH_INTERVAL) while fresh images keep coming in. As soon as a cycle
-  // adds nothing new, the delay grows (×1.7, capped at MAX_DELAY) so we're not
-  // hammering the API for content that isn't there yet. The moment something
-  // new does come back, delay snaps back to FETCH_INTERVAL immediately.
-  let currentDelay = FETCH_INTERVAL;
-  const MAX_DELAY  = 30000;
-  let pollTimer = null;
-
-  function scheduleNext() {
-    clearTimeout(pollTimer);
-    pollTimer = setTimeout(async () => {
-      const gotNew = await cycle();
-      currentDelay = gotNew ? FETCH_INTERVAL : Math.min(MAX_DELAY, Math.round(currentDelay * 1.7));
-      loaderEl.textContent = gotNew ? "loading more…" : "no new pics right now — retrying…";
-      scheduleNext();
-    }, currentDelay);
+    if (docH - scrollTop - window.innerHeight < PREFETCH) cycle();
   }
 
   async function init() {
     statusEl.textContent = "loading";
     rowH = TARGET_ROW_H(); lastWidth = window.innerWidth;
-    for (let i = 0; i < 3; i++) await cycle();
+
+    let ok = await cycle();
+    if (!ok) {
+      statusEl.textContent = "couldn't reach the pawsocks API — tap to retry";
+      statusEl.style.cursor = "pointer";
+      statusEl.onclick = () => { statusEl.onclick = null; statusEl.style.cursor = ""; init(); };
+      return;
+    }
     statusEl.remove();
-    scheduleNext();
+    await fillScreen();
     window.addEventListener("scroll", onScroll, { passive: true });
   }
 
